@@ -1,25 +1,27 @@
 import atexit
-import tomllib
 import logging
-import psutil
-import time
-# import concurrent.futures
-import threading
+import tomllib
+from contextlib import suppress
 from pathlib import Path
+from threading import Thread
+from time import sleep
 from typing import Any
 
-import telebot
-from telebot import types
+import psutil
+from telebot import types, apihelper, TeleBot
 
 # Configure logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger: logging.Logger = logging.getLogger(Path(__file__).stem)
 
 with open("config.toml", 'rb') as f_in:
     config: dict[str, Any] = tomllib.load(f_in)
 
 # Start a bot instance
-bot = telebot.TeleBot(config['TOKEN'])
-USERS_LIST: Path = Path("users_list.txt")
+bot = TeleBot(config['TOKEN'])
+
+PROCESS_NAME: str = config['procName']
+USERS_LIST: Path = Path(config['usersList'])
 users: set[int]
 if USERS_LIST.exists():
     with open(USERS_LIST, "rt") as f_in:
@@ -29,89 +31,105 @@ else:
 
 
 @bot.message_handler(commands=['start'])
-def start(message):
+def start(message) -> None:
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    btn1 = types.KeyboardButton("/start")
-    markup.add(btn1)
-    bot.send_message(message.from_user.id, "Monitoring started!", reply_markup=markup)
-    users.add(message.from_user.id)
+    markup.add(types.KeyboardButton("/start"))
+    user: int = message.from_user.id
+    bot.send_message(user, "Monitoring started!", reply_markup=markup)
+    users.add(user)
+    logger.info(f'User {user} joined')
 
 
-def send_startup_message():
-    for userid in users:
+def send_startup_message() -> None:
+    for userid in users.copy():
         try:
             bot.send_message(chat_id=userid, text='⚠️ Computer has been started up.')
-        except Exception as e:
-            logging.error(f'Error while sending startup message: {e}')
+        except apihelper.ApiTelegramException as ex:
+            if ex.error_code == 403:
+                users.discard(userid)
+                logger.info(f'Error while sending startup message: {ex}')
+            else:
+                logger.error(f'Error while sending startup message: {ex}')
+        except Exception as ex:
+            logger.error(f'{type(ex)} while sending startup message: {ex}')
 
 
-def send_shutdown_message():
-    for userid in users:
+def send_shutdown_message() -> None:
+    for userid in users.copy():
         try:
             bot.send_message(chat_id=userid, text='⚠️ Computer has been shut down.')
-        except Exception as e:
-            logging.error(f'Error while sending shutdown message: {e}')
+        except apihelper.ApiTelegramException as ex:
+            if ex.error_code == 403:
+                users.discard(userid)
+                logger.info(f'Error while sending shutdown message: {ex}')
+            else:
+                logger.error(f'Error while sending shutdown message: {ex}')
+        except Exception as ex:
+            logger.error(f'{type(ex)} while sending shutdown message: {ex}')
 
     with open(USERS_LIST, 'wt') as f_out:
         f_out.writelines(f'{user}\n' for user in users)
 
 
-def check_process(process_name):
+def check_process(process_name: str) -> bool:
     """
     Check if there is any running process that contains the given name processName.
     """
+    process_name = process_name.casefold()
     # Iterate over the all the running process
     for proc in psutil.process_iter():
-        try:
+        with suppress(psutil.Error):
             # Check if process name contains the given name string.
-            if process_name.lower() in proc.name().lower():
+            if process_name in proc.name().casefold():
                 return True
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            pass
     return False
 
 
-def proc_status(process_name):
-    # TODO: loop breaking
-    try:
-        while True:
-            # Check if process was running or not.
-            if check_process(process_name):
-                for userid in users:
-                    try:
-                        bot.send_message(chat_id=userid, text='Requested process was running')
-                        time.sleep(5)
-                    except Exception as e:
-                        logging.error(f'Error while sending process status message: {e}')
-            else:
-                for userid in users:
-                    try:
-                        bot.send_message(chat_id=userid, text='No requested process was running')
-                        time.sleep(5)
-                    except Exception as e:
-                        logging.error(f'Error while sending process status message: {e}')
-    except KeyboardInterrupt:
-        for userid in users:
-            try:
-                bot.send_message(chat_id=userid, text='Requested process checking interrupted')
-            except Exception as e:
-                logging.error(f'Error while sending process status message: {e}')
+def proc_status(process_name: str) -> None:
+    """
+    Check if process was running or not.
+    """
+
+    is_running: bool
+    was_running: bool = check_process(process_name)
+    text: str
+    while True:
+        is_running = check_process(process_name)
+        if not was_running and is_running:
+            text = f'`{process_name}` has started'
+        elif was_running and not is_running:
+            text = f'`{process_name}` has ended'
+        else:
+            text = ''
+        if text:
+            for userid in users.copy():
+                try:
+                    bot.send_message(chat_id=userid, text=text, parse_mode='MarkdownV2')
+                    logger.info(text)
+                except apihelper.ApiTelegramException as ex:
+                    if ex.error_code == 403:
+                        users.discard(userid)
+                        logger.info(f'Error while sending process status message: {ex}')
+                    else:
+                        logger.error(f'Error while sending process status message: {ex}')
+                except Exception as ex:
+                    logger.error(f'{type(ex)} while sending process status message: {ex}')
+        was_running = is_running
+        sleep(5)
 
 
-send_startup_message()
+def main() -> None:
+    send_startup_message()
 
-# with concurrent.futures.ThreadPoolExecutor() as executor:
-#     futures = [executor.submit(bot.polling(interval=0)), executor.submit(proc_status, 'chrome')]
-#     concurrent.futures.wait(futures)
+    process_checker: Thread = Thread(target=proc_status, args=(PROCESS_NAME,), daemon=True)
 
-thread_one = threading.Thread(target=bot.polling(non_stop=True, interval=0))
-thread_two = threading.Thread(target=proc_status('REQUESTED_PROCESS_HERE'))
+    # Start threads
+    process_checker.start()
+    bot.polling(non_stop=True, interval=0)
 
-# Start threads
-thread_one.start()
-thread_two.start()
 
-# TODO: for some reason thread_two doesn't start concurrently
+if __name__ == '__main__':
+    # Register the send_shutdown_message function to be executed when the program exits
+    atexit.register(send_shutdown_message)
 
-# Register the send_shutdown_message function to be executed when the program exits
-atexit.register(send_shutdown_message)
+    main()
