@@ -111,5 +111,7 @@ thread_two = threading.Thread(target=proc_status('REQUESTED_PROCESS_HERE'))
 thread_one.start()
 thread_two.start()
 
+# TODO: for some reason thread_two doesn't start concurrently
+
 # Register the send_shutdown_message function to be executed when the program exits
 atexit.register(send_shutdown_message)
